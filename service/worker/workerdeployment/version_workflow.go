@@ -964,6 +964,10 @@ func (d *VersionWorkflowRunner) handleSyncState(ctx workflow.Context, args *depl
 		state.LastDeactivationTime = nil
 	}
 
+	if err := d.syncVersionDataToComputeStatus(ctx); err != nil {
+		return nil, err
+	}
+
 	return &deploymentspb.SyncVersionStateResponse{
 		Summary: versionStateToSummary(state),
 	}, nil
@@ -1242,6 +1246,27 @@ func (d *VersionWorkflowRunner) syncVersionStatusAfterDrainageStatusChange(ctx w
 	}
 
 	return d.syncVersionDataToTaskQueues(ctx, versionData)
+}
+
+// syncVersionDataToComputeStatus is a helper that syncs the compute status from WCI to the worker deployment version
+func (d *VersionWorkflowRunner) syncVersionDataToComputeStatus(ctx workflow.Context) error {
+	if workflow.GetVersion(ctx, "sync-compute-validation-status", workflow.DefaultVersion, 0) == workflow.DefaultVersion {
+		return nil
+	}
+
+	state := d.GetVersionState()
+
+	var result deploymentpb.ComputeStatus
+	resp := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, defaultActivityOptions), d.a.DescribeWorkerControllerInstanceStatus, state.GetVersion())
+	if err := resp.Get(ctx, &result); err != nil {
+		return err
+	}
+	if result.ProviderValidation == nil {
+		return nil
+	}
+
+	state.ComputeStatus = &result
+	return nil
 }
 
 // syncVersionDataToTaskQueues is a helper that syncs the provided version data to all task queues.

@@ -199,6 +199,15 @@ func (a *VersionActivities) GetVersionDrainageStatus(ctx context.Context, versio
 	}, nil
 }
 
+func (a *VersionActivities) DescribeWorkerControllerInstanceStatus(ctx context.Context, version *deploymentspb.WorkerDeploymentVersion) (*deploymentpb.ComputeStatus, error) {
+	resp, _, err := a.WorkerControllerInstanceClient.DescribeWorkerControllerInstance(ctx, a.namespace, &deploymentpb.WorkerDeploymentVersion{DeploymentName: version.GetDeploymentName(), BuildId: version.GetBuildId()})
+	if err != nil {
+		return nil, err
+	}
+
+	return wciValidationStatusToComputeStatus(resp.ValidationStatus), nil
+}
+
 func (a *VersionActivities) UpdateWorkerControllerInstance(ctx context.Context, input *deploymentspb.UpdateWorkerControllerInstanceInput) (*computepb.ComputeConfigSummary, error) {
 	upserts := scalingGroupUpdatesToWCI(input.GetUpsertScalingGroups())
 	resp, err := a.WorkerControllerInstanceClient.UpdateWorkerControllerInstance(ctx, a.namespace, input.GetVersion(), nil, input.GetIdentity(), upserts, input.GetRemoveScalingGroups())
