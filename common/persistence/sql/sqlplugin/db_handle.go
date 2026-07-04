@@ -79,16 +79,9 @@ func (h *DatabaseHandle) reconnect(force bool) *sqlx.DB {
 	}
 
 	prevConn := h.db.Load()
-	if prevConn != nil {
-		if !force {
-			// Another goroutine already reconnected
-			return prevConn
-		}
-
-		h.db.Store(nil)
-		// Store `nil` to prevent other goroutines from slamming the now-unusable database with
-		// transactions we know will fail
-		go prevConn.Close()
+	if prevConn != nil && !force {
+		// Another goroutine already reconnected
+		return prevConn
 	}
 
 	metrics.PersistenceSessionRefreshAttempts.With(h.metrics).Record(1)
@@ -100,7 +93,12 @@ func (h *DatabaseHandle) reconnect(force bool) *sqlx.DB {
 			tag.Duration("min_refresh_interval_seconds", sessionRefreshMinInternal))
 		handler := h.metrics.WithTags(metrics.FailureTag("throttle"))
 		metrics.PersistenceSessionRefreshFailures.With(handler).Record(1)
-		return nil
+		// Keep serving the existing pool (if any) rather than discarding it: a
+		// single transient error does not imply the whole pool is poisoned, and
+		// database/sql already discards bad connections individually via
+		// driver.ErrBadConn. Discarding here would leave the handle without a
+		// pool -- and decline to rebuild it -- against a healthy database.
+		return prevConn
 	}
 
 	h.lastRefresh = now
@@ -109,10 +107,22 @@ func (h *DatabaseHandle) reconnect(force bool) *sqlx.DB {
 		h.logger.Error("sql handle: unable to refresh database connection pool", tag.Error(err))
 		handler := h.metrics.WithTags(metrics.FailureTag("error"))
 		metrics.PersistenceSessionRefreshFailures.With(handler).Record(1)
+		if prevConn != nil {
+			h.db.Store(nil)
+			// The database is genuinely unreachable: discard the old pool so
+			// other goroutines fail fast instead of queuing transactions we
+			// know will fail against dead connections.
+			go prevConn.Close()
+		}
 		return nil
 	}
 
+	// Swap-then-close: the replacement pool is ready before the old one is
+	// closed, so the handle is never left without a usable pool.
 	h.db.Store(newConn)
+	if prevConn != nil {
+		go prevConn.Close()
+	}
 	return newConn
 }
 
