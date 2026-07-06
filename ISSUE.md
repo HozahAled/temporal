@@ -1,4 +1,4 @@
-**TL;DR:** `DatabaseHandle.reconnect(force=true)` closes the SQL connection pool *before* checking the refresh throttle. If the refresh is throttled, the pool is gone **and** not rebuilt — so a single sub-second transient error against a healthy database makes the persistence handle unavailable (`no usable database connection found`) for up to ~1s, and any goroutine still holding the old pool fails with `sql: database is closed`. Deterministic repro tests below; no real database required.
+**TL;DR:** `DatabaseHandle.reconnect(force=true)` closes the SQL connection pool *before* checking the refresh throttle. If the refresh is throttled, the pool is gone **and** not rebuilt. Because every SQL store in a service process shares this one handle (`common/persistence/sql/factory.go` — the ref-counted `mainDBConn`), a single sub-second transient error takes down **all SQL persistence for that host** (`no usable database connection found`) until the ~1s throttle window expires, and goroutines still holding the old pool fail with `sql: database is closed`. The trap is self-healing: on its own it is a bounded availability dip, **not a prolonged outage** — sustained unavailability additionally requires `connect()` to keep failing or a continuing burst of refresh-triggering errors. Deterministic repro tests below; no real database required.
 
 ## Expected Behavior
 
@@ -34,9 +34,13 @@ If a refresh-triggering error lands inside the 1s throttle window (`sessionRefre
 - Until the window expires, `DB()` returns `no usable database connection found`, and `Conn()` hands out an `invalidConn` whose every operation returns that error.
 - Under a **burst** of connection errors this repeats: the first error closes the pool, subsequent ones are throttled out of rebuilding it, and a rebuild at window expiry is torn down again by the next error.
 
-### Scope
+### Blast radius
 
-Pinned by the tests below: the throttle self-heals within ~1 refresh interval once errors pause — a *prolonged* outage additionally requires `connect()` to keep failing. So this is a bounded availability dip, not a permanent wedge; the defect is that a sub-second transient is amplified into a visible one, and it may compound with upstream retry behavior.
+The handle is process-wide: every SQL store created by the persistence factory — shard, execution, task, metadata, cluster metadata, queue, Nexus endpoint — borrows the **same** ref-counted `mainDBConn`, and therefore the same `DatabaseHandle` (`common/persistence/sql/factory.go`: `NewFactory` creates one `mainDBConn`; every `New*Store` calls `f.mainDBConn.Get()`). While the handle is in the trapped state, **all** SQL persistence operations on that host fail, not just the caller that hit the transient error.
+
+### Scope / duration
+
+Pinned by the tests below: the throttle self-heals within ~1 refresh interval once errors pause — a *prolonged* outage additionally requires `connect()` to keep failing (i.e., a real database outage) or a sustained burst of refresh-triggering errors, each of which tears down the freshly rebuilt pool. So this is a bounded availability dip, not a permanent wedge; the defect is that a sub-second transient against a healthy database is amplified into a host-wide, visible one, and it may compound with upstream retry behavior.
 
 We recognize the eager close is intentional (the comment at `:89-90` aims to stop goroutines "slamming the now-unusable database"). But `database/sql` already discards bad connections per-connection via `driver.ErrBadConn`, so a single transient error does not imply the whole pool is poisoned — and discarding a working pool while refusing to rebuild it is the worse failure mode.
 
