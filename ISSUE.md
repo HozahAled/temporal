@@ -1,10 +1,15 @@
+**TL;DR:** `DatabaseHandle.reconnect(force=true)` closes the SQL connection pool *before* checking the refresh throttle. If the refresh is throttled, the pool is gone **and** not rebuilt — so a single sub-second transient error against a healthy database makes the persistence handle unavailable (`no usable database connection found`) for up to ~1s, and any goroutine still holding the old pool fails with `sql: database is closed`. Deterministic repro tests below; no real database required.
+
 ## Expected Behavior
 
-A single transient connection error against a healthy database should not make the SQL persistence handle unavailable: `DatabaseHandle` should keep (or promptly rebuild) a usable pool, and a refresh should not fail operations on the previously-borrowed pool.
+A single transient connection error against a healthy database should not make the SQL persistence handle unavailable:
+
+- `DatabaseHandle` should keep (or promptly rebuild) a usable pool.
+- A refresh should not fail operations on the previously-borrowed pool.
 
 ## Actual Behavior
 
-`DatabaseHandle.reconnect(force=true)` closes the connection pool **before** checking the refresh throttle (`common/persistence/sql/sqlplugin/db_handle.go` — identical on `v1.31.0` and `main` @ `a31f4762`, so the line refs apply to both):
+The pool is discarded before the throttle is consulted (`common/persistence/sql/sqlplugin/db_handle.go` — identical on `v1.31.0` and `main` @ `a31f4762`, so the line refs apply to both):
 
 ```go
 h.db.Store(nil)          // :88
@@ -15,34 +20,50 @@ if now.Sub(lastRefresh) < sessionRefreshMinInternal { // :98  throttle checked A
 }
 ```
 
-Two defects:
+This causes two defects.
 
-1. **Operations issued on the already-borrowed pool fail with `sql: database is closed`.** Stdlib `Close` lets queries that already started finish, but any goroutine that borrowed the previous `*sqlx.DB` fails on its next operation.
-2. **A healthy DB is reported unavailable without retrying `connect()`.** If a refresh-triggering error lands inside the 1s `sessionRefreshMinInternal` window (`db_handle.go:24`, already marked `// TODO: this should be dynamic config.`), the pool is discarded and not rebuilt: `DB()` returns `no usable database connection found` (and `Conn()` hands out an `invalidConn` whose every operation returns it) for up to ~1s, even though `connect()` would succeed immediately. Under a burst of connection errors this repeats: the first error closes the pool, subsequent ones are throttled out of rebuilding it, and a rebuild at window expiry is torn down again by the next error.
+### Defect 1 — the already-borrowed pool is invalidated
 
-Scoping (pinned by the tests below): the throttle self-heals within ~1 refresh interval once errors pause — a prolonged outage additionally requires `connect()` to keep failing. The defects amplify a sub-second transient into a visible availability dip, and may compound with upstream retry behavior.
+Stdlib `Close` lets queries that already started finish, but any goroutine that borrowed the previous `*sqlx.DB` fails on its next operation with `sql: database is closed`.
+
+### Defect 2 — a healthy DB is reported unavailable without retrying `connect()`
+
+If a refresh-triggering error lands inside the 1s throttle window (`sessionRefreshMinInternal`, `db_handle.go:24`, already marked `// TODO: this should be dynamic config.`):
+
+- The pool is discarded (`:88`/`:91`) but the throttled branch returns without calling `connect()` — even though `connect()` would succeed immediately.
+- Until the window expires, `DB()` returns `no usable database connection found`, and `Conn()` hands out an `invalidConn` whose every operation returns that error.
+- Under a **burst** of connection errors this repeats: the first error closes the pool, subsequent ones are throttled out of rebuilding it, and a rebuild at window expiry is torn down again by the next error.
+
+### Scope
+
+Pinned by the tests below: the throttle self-heals within ~1 refresh interval once errors pause — a *prolonged* outage additionally requires `connect()` to keep failing. So this is a bounded availability dip, not a permanent wedge; the defect is that a sub-second transient is amplified into a visible one, and it may compound with upstream retry behavior.
 
 We recognize the eager close is intentional (the comment at `:89-90` aims to stop goroutines "slamming the now-unusable database"). But `database/sql` already discards bad connections per-connection via `driver.ErrBadConn`, so a single transient error does not imply the whole pool is poisoned — and discarding a working pool while refusing to rebuild it is the worse failure mode.
 
 ## Steps to Reproduce the Problem
 
-Deterministic tests against the real `DatabaseHandle` via its injectable clock/connect seams — no real database required. Branch [`HozahAled/temporal@db-handle-reconnect-throttle-bug`](https://github.com/HozahAled/temporal/tree/db-handle-reconnect-throttle-bug), file `common/persistence/sql/sqlplugin/db_handle_bug_test.go`:
+Deterministic tests against the real `DatabaseHandle` via its existing constructor seams (injectable `connect` func and `clock.TimeSource`) — no real database required.
+
+Branch: [`HozahAled/temporal@db-handle-reconnect-throttle-bug`](https://github.com/HozahAled/temporal/tree/db-handle-reconnect-throttle-bug) (exactly one test file added on top of `a31f4762`; production code untouched), file `common/persistence/sql/sqlplugin/db_handle_bug_test.go`:
 
 ```
 go test -run TestDBHandleBug -v ./common/persistence/sql/sqlplugin/
 ```
 
-- `TestDBHandleBug_EXPECTED_HealthyDBStaysUsable` — **red test** asserting the desired behavior; fails on current code with:
+| Test | Result | Shows |
+|---|---|---|
+| `TestDBHandleBug_EXPECTED_HealthyDBStaysUsable` | **FAILS** (red test) | Asserts the desired behavior; fails on current code — see output below |
+| `TestDBHandleBug_ThrottleTrap_UnavailableDespiteHealthyDB` | passes | After one transient error inside the window, the handle is unavailable and `connect()` is never retried |
+| `TestDBHandleBug_ForceCloseInvalidatesHeldPool` | passes | An operation on the previously-borrowed pool gets `sql: database is closed` |
+| `TestDBHandleBug_SustainedWedgeRequiresFailingConnect` | passes | Pins the scope above: prolonged unavailability only while `connect()` fails; recovery on the first call after it succeeds |
 
-  ```
-  Error:      Received unexpected error:
-              no usable database connection found
-  Messages:   a single transient error must not make a healthy database unavailable
-  ```
+Red-test output on current code:
 
-- `TestDBHandleBug_ThrottleTrap_UnavailableDespiteHealthyDB` — passes: after one transient error inside the window, the handle is unavailable and `connect()` is never retried.
-- `TestDBHandleBug_ForceCloseInvalidatesHeldPool` — passes: an operation on the previously-borrowed pool gets `sql: database is closed`.
-- `TestDBHandleBug_SustainedWedgeRequiresFailingConnect` — passes: pins the scoping above (prolonged unavailability only while `connect()` fails; recovery on the first call after it succeeds).
+```
+Error:      Received unexpected error:
+            no usable database connection found
+Messages:   a single transient error must not make a healthy database unavailable
+```
 
 ## Suggested fix
 
@@ -53,7 +74,13 @@ Either makes the red test pass:
 
 Independently, `sessionRefreshMinInternal` could become dynamic config per its existing TODO.
 
+## Related history
+
+- #5926 introduced this reconnect/refresh design.
+- #6514 ("Stuck Temporal Server", same error string) was a *different* bug in the *same* throttle logic — `lastRefresh` was advanced even when throttled, so the handle never reconnected. Fixed by #6538 (+ tests in #6652). That fix did **not** move the pool close after the throttle check, which is the defect reported here.
+- #8202 (open): unrecoverable `no usable database connection found` after node replacement — possibly field evidence of this failure mode compounding.
+
 ## Specifications
 
-- Version: observed on Temporal Server v1.31.0; reproduced on `main` @ `a31f4762` (`db_handle.go` unchanged between them)
-- Platform: observed with PostgreSQL (`postgres12_pgx`); the code path and repro are DB-agnostic
+- **Version**: observed on Temporal Server v1.31.0; reproduced on `main` @ `a31f4762` (`db_handle.go` unchanged between them)
+- **Platform**: observed with PostgreSQL (`postgres12_pgx`); the code path and repro are DB-agnostic
